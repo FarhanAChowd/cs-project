@@ -52,7 +52,6 @@ void init_queue(URLQueue *q) {
 
 // Add a node to the tail of the queue
 void enqueue_node(URLQueue *q, Node *node) {
-    node->next = NULL;
     pthread_mutex_lock(&q->lock);
     if (q->tail) {
         q->tail->next = node;
@@ -63,15 +62,22 @@ void enqueue_node(URLQueue *q, Node *node) {
     pthread_mutex_unlock(&q->lock);
 }
 
-// Remove and return a node from the head of the queue
+// Remove and return url from the queue
 Node *dequeue_node(URLQueue *q) {
     pthread_mutex_lock(&q->lock);
+
+    // check if queue is empty
+    if (q->head == NULL) {
+        pthread_mutex_unlock(&q->lock);
+        return NULL;
+    }
+
     Node *node = q->head;
-    if (node) {
-        q->head = node->next;
-        if (q->head == NULL) {
-            q->tail = NULL;
-        }
+    // update queue to the next node
+    q->head = q->head->next;
+    // update queue's properies if queue is empty
+    if (q->head == NULL) {
+        q->tail = NULL;
     }
     pthread_mutex_unlock(&q->lock);
     return node;
@@ -124,6 +130,7 @@ Node *create_node(const char *url, int depth, Node *parent) {
     node->next = NULL;
     return node;
 }
+
 void normalize_inplace(char *url) {
     char *hash = strchr(url, '#');
     if (hash) *hash = '\0';
@@ -206,6 +213,7 @@ struct MemoryChunk {
     size_t size;
 };
 
+// Helper function to write fetched page into memory
 size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t total = size * nmemb;
     struct MemoryChunk *mem = (struct MemoryChunk *)userp;
@@ -235,8 +243,9 @@ char *fetch_page(const char *url) {
     chunk.size = 0;
 
     curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    // add callback function to write data to memory
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    // write data to a variable
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "simple-mt-crawler/1.0");
 
@@ -255,22 +264,16 @@ char *fetch_page(const char *url) {
 
 // Decide whether to add new_url as a child of current in the BFS
 void maybe_add_link(Node *current, const char *new_url) {
-    // Check depth limit first
-    if (current->depth + 1 > max_depth) {
-        return;
-    }
-
     // Check visited list
     pthread_mutex_lock(&visited_lock);
     if (visited_contains_locked(new_url)) {
         pthread_mutex_unlock(&visited_lock);
         return;
     }
-
-    // Not visited yet -> create child node and mark visited
-    Node *child = create_node(new_url, current->depth + 1, current);
-    visited_add_locked(child->url);
     pthread_mutex_unlock(&visited_lock);
+
+    // Not visited yet -> create child node
+    Node *child = create_node(new_url, current->depth + 1, current);
 
     // Check if this child is the target page
     pthread_mutex_lock(&result_lock);
@@ -278,11 +281,12 @@ void maybe_add_link(Node *current, const char *new_url) {
         found = 1;
         found_node = child;
         pthread_mutex_unlock(&result_lock);
+        printf("FOUND TARGET!\n");
         return; // do not enqueue; we already have the path
     }
     pthread_mutex_unlock(&result_lock);
 
-    // Not the target -> add to queue for further crawling
+    // add to queue for further crawling
     enqueue_node(&url_queue, child);
 }
 
@@ -290,6 +294,8 @@ void maybe_add_link(Node *current, const char *new_url) {
 void parse_links(Node *current, const char *html) {
     const char *p = html;
 
+    // only parse link from main body of the page
+    p = strstr(p, "<div id=\"bodyContent");
     while ((p = strstr(p, "<a")) != NULL) {
         // Stop early if someone already found the target
         pthread_mutex_lock(&result_lock);
@@ -297,7 +303,8 @@ void parse_links(Node *current, const char *html) {
         pthread_mutex_unlock(&result_lock);
         if (done) return;
 
-        const char *href_attr = strstr(p, "href=\"");
+        // only check wiki links
+        const char *href_attr = strstr(p, "href=\"/wiki");
         if (!href_attr) {
             p += 2; // move forward a bit
             continue;
@@ -341,7 +348,7 @@ void parse_links(Node *current, const char *html) {
 void print_path(Node *node) {
     if (!node) return;
 
-    int capacity = 16;
+    int capacity = 50;
     int count = 0;
     Node **list = malloc(sizeof(Node *) * capacity);
     if (!list) {
@@ -375,26 +382,14 @@ void print_path(Node *node) {
         perror("fopen path_output.txt");
     }
 
-    // Print from start to target, with step numbers and short titles
+    // Print from start to target, with step numbers and full url
     int step = 0;
     for (int i = count - 1; i >= 0; --i) {
         const char *full = list[i]->url;
 
-        // Get just the last part after /wiki/
-        const char *title = strrchr(full, '/');
-        title = title ? title + 1 : full;
-
-        // Make a simple copy where '_' becomes ' '
-        char pretty[512];
-        size_t j = 0;
-        for (size_t k = 0; title[k] && j < sizeof(pretty) - 1; ++k) {
-            pretty[j++] = (title[k] == '_') ? ' ' : title[k];
-        }
-        pretty[j] = '\0';
-
-        printf("%d. %s\n", step, pretty);   // step: 0 = start, last = target
+        printf("%d. %s\n", step, full);   // step: 0 = start, last = target
         if (outfile) {
-            fprintf(outfile, "%d. %s\n", step, pretty);
+            fprintf(outfile, "%d. %s\n", step, full);
         }
         step++;
     }
@@ -411,31 +406,53 @@ void print_path(Node *node) {
 // parses links, and adds new URLs to the queue.
 void *worker_thread(void *arg) {
     (void)arg;
-
-    while (1) {
+    int done = 0;
+    int current_depth = 0;
+    while (!done) {
         // Stop if another thread already found the target
         pthread_mutex_lock(&result_lock);
-        int done = found;
+        done = found;
         pthread_mutex_unlock(&result_lock);
         if (done) break;
 
-        // Get next page from queue
+        // Get next url from queue
         Node *current = dequeue_node(&url_queue);
-        if (!current) {
-            break; // queue empty -> nothing left to do
+        if (current == NULL) {
+            continue; // queue empty -> move on
         }
 
-
-
-        // Download the HTML
-        char *html = fetch_page(current->url);
-        if (!html) {
-            continue; // network error; skip this branch
+        current_depth = current->depth;
+        // stop loop if current depth is greater than required depth
+        if (current_depth > max_depth) {
+            free(current);
+            break;
         }
 
-        // Parse links in this page
-        parse_links(current, html);
-        free(html);
+        // check if url is visited, skip fetching if yes
+        pthread_mutex_lock(&visited_lock);
+        if (visited_contains_locked(current->url)) {
+            pthread_mutex_unlock(&visited_lock);
+            free(current);
+            continue;
+        }
+        // add url to visited variable
+        visited_add_locked(current->url);
+        pthread_mutex_unlock(&visited_lock);
+
+        // if the current depth is equal to max depth, don't need to fetch new page
+        if (current_depth + 1 <= max_depth) {            
+            // Download the HTML
+            char *html = fetch_page(current->url);
+            if (!html) {
+                free(current);
+                continue; // network error; skip this branch
+            }
+            // Parse links in this page
+            parse_links(current, html);
+            free(html);
+        } else {
+            maybe_add_link(current, "N/A");
+        }
     }
 
     return NULL;
@@ -484,7 +501,7 @@ int read_urls_from_file(const char *filename,
         return -1;
     }
     *depth_out = atoi(line);
-
+    
     fclose(f);
     return 0;
 }
@@ -549,10 +566,7 @@ int main(int argc, char *argv[]) {
     }
     init_queue(&url_queue);
 
-    pthread_mutex_lock(&visited_lock);
     Node *root = create_node(start_url, 0, NULL);
-    visited_add_locked(root->url);
-    pthread_mutex_unlock(&visited_lock);
 
     enqueue_node(&url_queue, root);
 
