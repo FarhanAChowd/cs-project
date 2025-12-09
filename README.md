@@ -25,7 +25,7 @@ multithreaded BFS
   - take URL from the queue
   - fetch it using liburl
   - Parses <a href="..."> links.
-  - and adds new Eikipedia article URLs back into BFS
+  - and adds new Wikipedia article URLs back into BFS
  
   Error handling (total of 25 (if you really want to count it in numbers))
   First main error handling: Input and usange errors *
@@ -38,7 +38,7 @@ If user calls with wrong arguments:
 - If start_url or target_url do not start with https://en.wikipedia.org/wiki/:
   - Print error and exit.
  
-Second main error handling: Memoery Allocation error
+Second main error handling: Memory Allocation error
 - when using malloc and strdup for nodes if fail call perror(...) and exit(EXIT_FAILURE)
 
 Third main error handling: libcurl/ network errors 
